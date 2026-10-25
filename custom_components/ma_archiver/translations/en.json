@@ -1,0 +1,38 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Music Assistant Archiver",
+        "description": "Automatically archive Music Assistant tracks to local storage (/media) when played and periodically in the background.",
+        "data": {
+          "output_dir": "Archive Output Directory",
+          "audio_format": "Audio Format",
+          "bitrate": "Audio Bitrate (for Opus/M4A)",
+          "archive_on_play": "Archive every song played on any speaker",
+          "periodic_scan": "Periodically archive unarchived library tracks in the background",
+          "scan_interval_minutes": "Background scan interval (minutes)",
+          "batch_size": "Tracks to archive per background scan"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "Music Assistant Archiver is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Music Assistant Archiver Options",
+        "data": {
+          "output_dir": "Archive Output Directory",
+          "audio_format": "Audio Format",
+          "bitrate": "Audio Bitrate (for Opus/M4A)",
+          "archive_on_play": "Archive every song played on any speaker",
+          "periodic_scan": "Periodically archive unarchived library tracks in the background",
+          "scan_interval_minutes": "Background scan interval (minutes)",
+          "batch_size": "Tracks to archive per background scan"
+        }
+      }
+    }
+  }
+}

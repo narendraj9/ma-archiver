@@ -244,14 +244,13 @@ class MusicAssistantArchiver:
                 await self._configure_virtual_player(mass)
 
         # Subscribe to Music Assistant events:
-        # - MEDIA_ITEM_ADDED / MEDIA_ITEM_UPDATED: ALWAYS archive any track added to the library
+        # - MEDIA_ITEM_ADDED: ALWAYS archive any track newly added to the library
         # - QUEUE_UPDATED / PLAYER_UPDATED: archive on play when enabled
         if self._unsub_mass_events is None:
             event_types = tuple(
                 getattr(EventType, name)
                 for name in (
                     "MEDIA_ITEM_ADDED",
-                    "MEDIA_ITEM_UPDATED",
                     "QUEUE_UPDATED",
                     "QUEUE_ITEMS_UPDATED",
                     "PLAYER_UPDATED",
@@ -318,8 +317,8 @@ class MusicAssistantArchiver:
         if not data:
             return
 
-        # 1. Always archive any track added to the library (regardless of archive_on_play)
-        if event.event in (EventType.MEDIA_ITEM_ADDED, EventType.MEDIA_ITEM_UPDATED):
+        # 1. Always archive any track newly added to the library (regardless of archive_on_play)
+        if event.event == EventType.MEDIA_ITEM_ADDED:
             media_type = getattr(data, "media_type", None) or (
                 data.get("media_type") if isinstance(data, dict) else None
             )

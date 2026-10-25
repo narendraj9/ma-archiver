@@ -92,54 +92,68 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
+    def _get_active_archiver() -> MusicAssistantArchiver | None:
+        entries = hass.data.get(DOMAIN, {})
+        if entry.entry_id in entries:
+            return entries[entry.entry_id]
+        return next(iter(entries.values()), None)
+
     async def handle_archive_now(call: ServiceCall) -> None:
         """Handle ma_archiver.archive_now service call."""
-        limit = call.data.get("limit")
-        hass.async_create_task(archiver.async_archive_batch(limit=limit))
+        active = _get_active_archiver()
+        if active:
+            limit = call.data.get("limit")
+            active.spawn_task(
+                active.async_archive_batch(limit=limit), "ma_archiver_batch"
+            )
 
     async def handle_archive_track(call: ServiceCall) -> None:
         """Handle ma_archiver.archive_track service call."""
-        uri = call.data["uri"]
-        archiver.enqueue_track(uri, delay=0.0)
+        active = _get_active_archiver()
+        if active:
+            uri = call.data["uri"]
+            active.enqueue_track(uri, delay=0.0)
 
     async def handle_refresh_library(call: ServiceCall) -> None:
         """Handle ma_archiver.refresh_library service call."""
-        limit = call.data.get("limit")
-        hass.async_create_task(archiver.async_refresh_library_items(limit=limit))
+        active = _get_active_archiver()
+        if active:
+            limit = call.data.get("limit")
+            active.spawn_task(
+                active.async_refresh_library_items(limit=limit), "ma_archiver_refresh"
+            )
 
     async def handle_reset_archive(call: ServiceCall) -> None:
         """Handle ma_archiver.reset_archive service call."""
-        delete_files = call.data.get("delete_files", True)
-        await archiver.async_reset_archive(delete_files=delete_files)
+        active = _get_active_archiver()
+        if active:
+            delete_files = call.data.get("delete_files", True)
+            await active.async_reset_archive(delete_files=delete_files)
 
-    if not hass.services.has_service(DOMAIN, SERVICE_ARCHIVE_NOW):
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_ARCHIVE_NOW,
-            handle_archive_now,
-            schema=SCHEMA_ARCHIVE_NOW,
-        )
-    if not hass.services.has_service(DOMAIN, SERVICE_ARCHIVE_TRACK):
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_ARCHIVE_TRACK,
-            handle_archive_track,
-            schema=SCHEMA_ARCHIVE_TRACK,
-        )
-    if not hass.services.has_service(DOMAIN, SERVICE_REFRESH_LIBRARY):
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_REFRESH_LIBRARY,
-            handle_refresh_library,
-            schema=SCHEMA_REFRESH_LIBRARY,
-        )
-    if not hass.services.has_service(DOMAIN, SERVICE_RESET_ARCHIVE):
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_RESET_ARCHIVE,
-            handle_reset_archive,
-            schema=SCHEMA_RESET_ARCHIVE,
-        )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_ARCHIVE_NOW,
+        handle_archive_now,
+        schema=SCHEMA_ARCHIVE_NOW,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_ARCHIVE_TRACK,
+        handle_archive_track,
+        schema=SCHEMA_ARCHIVE_TRACK,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_REFRESH_LIBRARY,
+        handle_refresh_library,
+        schema=SCHEMA_REFRESH_LIBRARY,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_RESET_ARCHIVE,
+        handle_reset_archive,
+        schema=SCHEMA_RESET_ARCHIVE,
+    )
 
     return True
 

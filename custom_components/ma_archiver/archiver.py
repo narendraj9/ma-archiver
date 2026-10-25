@@ -62,6 +62,23 @@ def _normalize_text(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
 
 
+def _read_flac_duration(path: Path) -> float | None:
+    """Parse FLAC STREAMINFO header (first 42 bytes) and return duration in seconds."""
+    try:
+        with path.open("rb") as f:
+            header = f.read(42)
+        if len(header) < 42 or header[:4] != b"fLaC":
+            return None
+        val = int.from_bytes(header[18:26], "big")
+        sample_rate = (val >> 44) & 0xFFFFF
+        total_samples = val & 0xFFFFFFFFF
+        if sample_rate <= 0 or total_samples <= 0:
+            return None
+        return total_samples / sample_rate
+    except OSError:
+        return None
+
+
 class MusicAssistantArchiver:
     """
     Coordinates on-play archiving and periodic background library archiving.
@@ -108,6 +125,8 @@ class MusicAssistantArchiver:
         self._unsub_mass_events: CALLBACK_TYPE | None = None
         self._unsub_timer: CALLBACK_TYPE | None = None
         self._worker_task: asyncio.Task[None] | None = None
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
+        self._stopped: bool = False
         self._queue: asyncio.Queue[tuple[str, float]] = asyncio.Queue()
         self._queued_uris: set[str] = set()
         self._failed_tracks: dict[str, float] = {}
@@ -126,6 +145,13 @@ class MusicAssistantArchiver:
         self.unarchived_library_tracks: int = 0
         self._filesystem_instance_id: str | None = None
         self._filesystem_base_path: str = "/media"
+
+    def spawn_task(self, coro: Any, name: str = "ma_archiver_task") -> asyncio.Task[Any]:
+        """Spawn and track a background task so it is cleanly cancelled on reload/stop."""
+        task = self.hass.async_create_background_task(coro, name)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
 
     @callback
     def async_add_listener(self, update_callback: CALLBACK_TYPE) -> CALLBACK_TYPE:
@@ -156,6 +182,7 @@ class MusicAssistantArchiver:
 
     async def async_start(self) -> None:
         """Start the virtual player, event subscriptions, worker loop, and periodic scan."""
+        self._stopped = False
         self._worker_task = self.hass.async_create_background_task(
             self._queue_worker(), "ma_archiver_worker"
         )
@@ -169,29 +196,34 @@ class MusicAssistantArchiver:
             )
 
         # Schedule an initial library stats refresh after startup
-        self.hass.async_create_task(self.async_refresh_library_stats())
+        self.spawn_task(self.async_refresh_library_stats(), "ma_archiver_stats")
 
     async def async_stop(self) -> None:
         """Stop timers, event listeners, worker task, and virtual Slimproto player."""
+        self._stopped = True
         if self._unsub_timer:
             self._unsub_timer()
             self._unsub_timer = None
         if self._unsub_mass_events:
             self._unsub_mass_events()
             self._unsub_mass_events = None
+        tasks_to_cancel = list(self._bg_tasks)
         if self._worker_task:
-            self._worker_task.cancel()
-            try:
-                await self._worker_task
-            except asyncio.CancelledError:
-                pass
+            tasks_to_cancel.append(self._worker_task)
             self._worker_task = None
+        for task in tasks_to_cancel:
+            task.cancel()
+        if tasks_to_cancel:
+            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+        self._bg_tasks.clear()
         if self._slimproto:
             await self._slimproto.stop()
             self._slimproto = None
 
     async def _ensure_connected_and_subscribed(self) -> MusicAssistantClient | None:
         """Ensure we have a connected MA client, Slimproto virtual player, and event subscription."""
+        if self._stopped:
+            return None
         mass, mass_url = self._get_mass_client()
         if not mass or not mass_url:
             _LOGGER.debug("Music Assistant integration is not loaded yet")
@@ -416,9 +448,11 @@ class MusicAssistantArchiver:
 
     async def _async_periodic_tick(self, _now: datetime | None = None) -> None:
         """Periodic timer callback to archive a batch of unarchived library tracks."""
-        if not self.periodic_scan:
+        if not self.periodic_scan or self._stopped:
             return
-        await self.async_archive_batch(limit=self.batch_size)
+        self.spawn_task(
+            self.async_archive_batch(limit=self.batch_size), "ma_archiver_periodic_batch"
+        )
 
     async def async_refresh_library_stats(self) -> list[ dict[str, Any] ]:
         """Fetch library tracks and update archived/unarchived counts."""
@@ -445,7 +479,7 @@ class MusicAssistantArchiver:
         archived = 0
         unarchived_tracks: list[dict[str, Any]] = []
         for track in all_tracks:
-            if self._has_local_mapping(track):
+            if await self._verify_or_heal_local_mapping(mass, track):
                 archived += 1
             else:
                 unarchived_tracks.append(track)
@@ -456,16 +490,89 @@ class MusicAssistantArchiver:
         self._notify_listeners()
         return unarchived_tracks
 
-    @staticmethod
-    def _has_local_mapping(track: dict[str, Any]) -> bool:
-        """Return True if the track dict already has an available filesystem_local mapping."""
+    def _check_local_file_sync(
+        self, rel_item_id: str, expected_duration: int
+    ) -> tuple[bool, float | None]:
+        """
+        Check on disk whether `/media/<rel_item_id>` exists and is not truncated.
+
+        Returns `(is_valid, actual_duration_if_truncated)`. If a truncated file is
+        found on disk, deletes it so it can be cleanly re-archived.
+        """
+        if not rel_item_id:
+            return False, None
+        abs_file = Path(self._filesystem_base_path) / rel_item_id
+        try:
+            if not abs_file.is_file() or abs_file.stat().st_size <= 16384:
+                return False, None
+        except OSError:
+            return False, None
+
+        if abs_file.suffix.lower() == ".flac" and expected_duration > 15:
+            actual_dur = _read_flac_duration(abs_file)
+            min_dur = max(15.0, float(expected_duration) * 0.80)
+            if actual_dur is not None and actual_dur < min_dur:
+                with contextlib.suppress(OSError):
+                    abs_file.unlink(missing_ok=True)
+                return False, actual_dur
+
+        return True, None
+
+    def _has_local_mapping(self, track: dict[str, Any]) -> bool:
+        """Return True if the track dict has a valid, non-truncated filesystem_local file."""
+        expected_duration = int(track.get("duration") or 0)
         for pm in track.get("provider_mappings", []):
             if pm.get("provider_domain") == "filesystem_local" and pm.get("available", True):
-                return True
+                valid, _ = self._check_local_file_sync(
+                    pm.get("item_id") or "", expected_duration
+                )
+                if valid:
+                    return True
         return False
+
+    async def _verify_or_heal_local_mapping(
+        self, mass: MusicAssistantClient, track: dict[str, Any]
+    ) -> bool:
+        """
+        Verify that a track's `filesystem_local` mapping exists on disk and is not truncated.
+
+        If a mapping points to a missing or truncated file, deletes the corrupted file
+        and removes the stale `filesystem_local` provider mapping in Music Assistant.
+        """
+        expected_duration = int(track.get("duration") or 0)
+        has_valid = False
+        for pm in list(track.get("provider_mappings", [])):
+            if pm.get("provider_domain") != "filesystem_local":
+                continue
+            rel_item_id = pm.get("item_id") or ""
+            valid, trunc_dur = await asyncio.to_thread(
+                self._check_local_file_sync, rel_item_id, expected_duration
+            )
+            if valid and pm.get("available", True):
+                has_valid = True
+            else:
+                if trunc_dur is not None:
+                    _LOGGER.warning(
+                        "Removed truncated archive file /media/%s (%.1fs vs expected %ds) for '%s'",
+                        rel_item_id,
+                        trunc_dur,
+                        expected_duration,
+                        track.get("name"),
+                    )
+                if track.get("item_id"):
+                    with contextlib.suppress(Exception):
+                        await mass.send_command(
+                            "music/remove_provider_mapping",
+                            media_type="track",
+                            db_id=str(track["item_id"]),
+                            mapping=pm,
+                        )
+        return has_valid
 
     async def async_archive_batch(self, limit: int | None = None) -> int:
         """Archive up to `limit` unarchived tracks from the Music Assistant library."""
+        if self._stopped:
+            return 0
         batch_limit = limit or self.batch_size
         unarchived = await self.async_refresh_library_stats()
         if not unarchived:
@@ -475,7 +582,7 @@ class MusicAssistantArchiver:
         now = time.monotonic()
         archived_count = 0
         for track in unarchived:
-            if archived_count >= batch_limit:
+            if self._stopped or archived_count >= batch_limit:
                 break
             uri = track.get("uri")
             if not uri:
@@ -487,7 +594,8 @@ class MusicAssistantArchiver:
             if success:
                 archived_count += 1
 
-        await self.async_refresh_library_stats()
+        if not self._stopped:
+            await self.async_refresh_library_stats()
         return archived_count
 
     async def async_refresh_library_items(self, limit: int | None = None) -> int:
@@ -500,6 +608,8 @@ class MusicAssistantArchiver:
         playable substitute, and calls `music/library/add_item` so Music Assistant
         attaches the active provider's mapping to the existing library track.
         """
+        if self._stopped:
+            return 0
         mass = await self._ensure_connected_and_subscribed()
         if not mass:
             return 0
@@ -508,7 +618,9 @@ class MusicAssistantArchiver:
         available_instances = {
             p["instance_id"]
             for p in providers_list
-            if p.get("available") and p.get("type") == "music"
+            if p.get("available")
+            and p.get("type") == "music"
+            and p.get("domain") != "filesystem_local"
         }
 
         all_tracks: list[dict[str, Any]] = []
@@ -621,7 +733,11 @@ class MusicAssistantArchiver:
 
         Returns True if the track was archived (or was already archived), False on failure.
         """
+        if self._stopped:
+            return False
         async with self._archive_lock:
+            if self._stopped:
+                return False
             mass = await self._ensure_connected_and_subscribed()
             if not mass or not self._slimproto:
                 return False
@@ -633,8 +749,8 @@ class MusicAssistantArchiver:
                     self._failed_tracks[uri] = time.monotonic()
                     return False
 
-                # Check if already archived locally
-                if self._has_local_mapping(track):
+                # Check if already archived locally (and verify on-disk file is intact & full duration)
+                if await self._verify_or_heal_local_mapping(mass, track):
                     _LOGGER.debug("Track %s (%s) is already archived locally", track.get("name"), uri)
                     return True
 
@@ -763,7 +879,9 @@ class MusicAssistantArchiver:
         available_instances = {
             p["instance_id"]
             for p in providers_list
-            if p.get("available") and p.get("type") == "music"
+            if p.get("available")
+            and p.get("type") == "music"
+            and p.get("domain") != "filesystem_local"
         }
 
         # Step 1: Check existing provider mappings on the track
@@ -1062,9 +1180,11 @@ class MusicAssistantArchiver:
                 await asyncio.to_thread(part_path.unlink, missing_ok=True)
             raise
 
-        # Verify output file exists and has valid audio size (>16 KB)
+        # Verify output file exists, ffmpeg exited cleanly, and has valid audio size (>16 KB)
         exists_and_valid = await asyncio.to_thread(
-            lambda: part_path.is_file() and part_path.stat().st_size > 16384
+            lambda: proc.returncode == 0
+            and part_path.is_file()
+            and part_path.stat().st_size > 16384
         )
         if not exists_and_valid:
             err_text = stderr.decode("utf-8", errors="replace").strip()
@@ -1074,4 +1194,43 @@ class MusicAssistantArchiver:
                 f"ffmpeg failed (rc={proc.returncode}): {err_text or 'output file empty'}"
             )
 
+        # Verify actual audio duration is not truncated (e.g. from a mid-stream drop)
+        actual_duration = await self._probe_audio_duration(part_path)
+        if (
+            expected_duration > 15
+            and actual_duration is not None
+            and actual_duration < max(15.0, float(expected_duration) * 0.85)
+        ):
+            with contextlib.suppress(OSError):
+                await asyncio.to_thread(part_path.unlink, missing_ok=True)
+            raise RuntimeError(
+                f"Truncated audio stream: recorded {actual_duration:.1f}s, expected ~{expected_duration}s"
+            )
+
         await asyncio.to_thread(os.replace, part_path, abs_target_path)
+
+    async def _probe_audio_duration(self, path: Path) -> float | None:
+        """Return actual audio duration in seconds from FLAC header or ffprobe."""
+        if path.suffix.lower() == ".flac":
+            dur = await asyncio.to_thread(_read_flac_duration, path)
+            if dur is not None:
+                return dur
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+            if proc.returncode == 0 and stdout:
+                return float(stdout.decode("utf-8", errors="replace").strip())
+        except Exception:
+            pass
+        return None

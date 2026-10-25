@@ -40,7 +40,9 @@ class MAArchiverBatchButton(ButtonEntity):
 
     async def async_press(self) -> None:
         """Handle button press."""
-        self.hass.async_create_task(self._archiver.async_archive_batch())
+        self._archiver.spawn_task(
+            self._archiver.async_archive_batch(), "ma_archiver_batch"
+        )
 
 
 class MAArchiverRefreshLibraryButton(ButtonEntity):
@@ -57,4 +59,6 @@ class MAArchiverRefreshLibraryButton(ButtonEntity):
 
     async def async_press(self) -> None:
         """Handle button press."""
-        self.hass.async_create_task(self._archiver.async_refresh_library_items())
+        self._archiver.spawn_task(
+            self._archiver.async_refresh_library_items(), "ma_archiver_refresh"
+        )

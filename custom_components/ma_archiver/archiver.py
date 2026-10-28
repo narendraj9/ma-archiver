@@ -131,6 +131,7 @@ class MusicAssistantArchiver:
         self._queued_uris: set[str] = set()
         self._failed_tracks: dict[str, float] = {}
         self._archive_lock = asyncio.Lock()
+        self._refresh_lock = asyncio.Lock()
         self._listeners: list[CALLBACK_TYPE] = []
 
         # Status / telemetry exposed to HA sensors
@@ -140,6 +141,7 @@ class MusicAssistantArchiver:
         self.last_archived_path: str | None = None
         self.last_error: str | None = None
         self.archived_session_count: int = 0
+        self.refreshed_session_count: int = 0
         self.total_library_tracks: int = 0
         self.archived_library_tracks: int = 0
         self.unarchived_library_tracks: int = 0
@@ -609,89 +611,131 @@ class MusicAssistantArchiver:
         """
         if self._stopped:
             return 0
-        mass = await self._ensure_connected_and_subscribed()
-        if not mass:
+        if self._refresh_lock.locked():
+            _LOGGER.info("Library refresh is already in progress; ignoring duplicate trigger")
             return 0
 
-        providers_list = await mass.send_command("providers")
-        available_instances = {
-            p["instance_id"]
-            for p in providers_list
-            if p.get("available")
-            and p.get("type") == "music"
-            and p.get("domain") != "filesystem_local"
-        }
+        async with self._refresh_lock:
+            mass = await self._ensure_connected_and_subscribed()
+            if not mass:
+                return 0
 
-        all_tracks: list[dict[str, Any]] = []
-        offset = 0
-        page_size = 500
-        while True:
-            batch = await mass.send_command(
-                "music/tracks/library_items",
-                limit=page_size,
-                offset=offset,
-            )
-            if not batch:
-                break
-            all_tracks.extend(batch)
-            if len(batch) < page_size:
-                break
-            offset += page_size
+            providers_list = await mass.send_command("providers")
+            available_instances = {
+                p["instance_id"]
+                for p in providers_list
+                if p.get("available")
+                and p.get("type") == "music"
+                and p.get("domain") != "filesystem_local"
+            }
+            all_available_instances = {
+                p["instance_id"]
+                for p in providers_list
+                if p.get("available") and p.get("type") == "music"
+            }
 
-        refreshed_count = 0
-        self.status = "refreshing_library"
-        self._notify_listeners()
-
-        try:
-            for track in all_tracks:
-                if limit is not None and refreshed_count >= limit:
+            all_tracks: list[dict[str, Any]] = []
+            offset = 0
+            page_size = 500
+            while True:
+                batch = await mass.send_command(
+                    "music/tracks/library_items",
+                    limit=page_size,
+                    offset=offset,
+                )
+                if not batch:
                     break
+                all_tracks.extend(batch)
+                if len(batch) < page_size:
+                    break
+                offset += page_size
+
+            dead_tracks: list[dict[str, Any]] = []
+            for track in all_tracks:
                 mappings = track.get("provider_mappings", [])
                 has_active_mapping = any(
-                    pm.get("provider_instance") in available_instances
+                    pm.get("provider_instance") in all_available_instances
                     and pm.get("available", True)
                     for pm in mappings
                 )
-                if has_active_mapping:
-                    continue
+                if not has_active_mapping:
+                    dead_tracks.append(track)
 
-                track_title = track.get("name") or "Unknown Track"
-                artists = [a.get("name") for a in track.get("artists", []) if a.get("name")]
-                artist_display = ", ".join(artists) if artists else "Unknown Artist"
-                self.current_track = f"Refreshing: {artist_display} - {track_title}"
-                self._notify_listeners()
+            total_dead = len(dead_tracks)
+            refreshed_count = 0
+            self.status = "refreshing_library"
+            self.current_track = f"Refreshing (0/{total_dead} unplayable tracks)"
+            self._notify_listeners()
 
-                playable_uri, _resolved = await self._resolve_playable_source(mass, track)
-                if not playable_uri:
-                    continue
+            try:
+                for idx, track in enumerate(dead_tracks, start=1):
+                    if self._stopped:
+                        break
+                    if limit is not None and refreshed_count >= limit:
+                        break
 
-                try:
-                    await mass.send_command(
-                        "music/library/add_item",
-                        item=playable_uri,
-                        overwrite_existing=True,
+                    db_id = str(track.get("item_id") or "")
+                    if not db_id:
+                        continue
+
+                    track_title = track.get("name") or "Unknown Track"
+                    artists = [a.get("name") for a in track.get("artists", []) if a.get("name")]
+                    artist_display = ", ".join(artists) if artists else "Unknown Artist"
+                    self.status = "refreshing_library"
+                    self.current_track = (
+                        f"Refreshing ({idx}/{total_dead}, {refreshed_count} linked): "
+                        f"{artist_display} - {track_title}"
                     )
-                    refreshed_count += 1
-                    _LOGGER.info(
-                        "Refreshed library track '%s' (%s) with %s",
-                        track_title,
-                        track.get("uri"),
-                        playable_uri,
-                    )
-                except Exception as err:
-                    _LOGGER.debug(
-                        "Could not refresh library track %s with %s: %s",
-                        track.get("uri"),
-                        playable_uri,
-                        err,
-                    )
-        finally:
-            self.status = "idle"
-            self.current_track = None
-            await self.async_refresh_library_stats()
+                    self._notify_listeners()
 
-        _LOGGER.info("Refreshed %d unplayable library tracks across active providers", refreshed_count)
-        return refreshed_count
+                    playable_uri, resolved_track = await self._resolve_playable_source(
+                        mass, track, available_instances=available_instances
+                    )
+                    if not playable_uri or not isinstance(resolved_track, dict):
+                        continue
+
+                    resolved_mappings = [
+                        pm
+                        for pm in resolved_track.get("provider_mappings", [])
+                        if pm.get("provider_instance") in available_instances
+                    ]
+                    if not resolved_mappings:
+                        continue
+
+                    try:
+                        await self._attach_mappings_to_library_track(
+                            mass, track, resolved_mappings
+                        )
+                        refreshed_count += 1
+                        self.refreshed_session_count += 1
+                        _LOGGER.info(
+                            "Refreshed library track '%s' (library://track/%s) with %s",
+                            track_title,
+                            db_id,
+                            playable_uri,
+                        )
+                    except Exception as err:
+                        _LOGGER.warning(
+                            "Could not attach provider mapping to library://track/%s (%s): %s",
+                            db_id,
+                            playable_uri,
+                            err,
+                        )
+            finally:
+                self.status = "idle"
+                self.current_track = None
+                if not self._stopped:
+                    with contextlib.suppress(Exception):
+                        await self.async_refresh_library_stats()
+                else:
+                    self._notify_listeners()
+
+            _LOGGER.info(
+                "Refreshed %d/%d unplayable library tracks across active providers",
+                refreshed_count,
+                total_dead,
+            )
+            return refreshed_count
 
     async def async_reset_archive(self, delete_files: bool = True) -> None:
         """
@@ -808,15 +852,47 @@ class MusicAssistantArchiver:
 
                 if self._filesystem_instance_id:
                     fs_uri = f"{self._filesystem_instance_id}://track/{rel_media_path}"
-                    added_item = await mass.send_command(
-                        "music/library/add_item",
-                        item=fs_uri,
-                    )
+                    linked_db_id: Any = None
+                    if track.get("provider") == "library" and track.get("item_id"):
+                        try:
+                            fs_item = await mass.send_command("music/item_by_uri", uri=fs_uri)
+                            fs_mappings = (
+                                fs_item.get("provider_mappings", [])
+                                if isinstance(fs_item, dict)
+                                else []
+                            )
+                            if fs_mappings:
+                                updated_item = await self._attach_mappings_to_library_track(
+                                    mass, track, fs_mappings
+                                )
+                                linked_db_id = (
+                                    updated_item.get("item_id")
+                                    if isinstance(updated_item, dict)
+                                    else track["item_id"]
+                                )
+                        except Exception as map_err:
+                            _LOGGER.debug(
+                                "Direct mapping merge failed for %s, falling back to add_item: %s",
+                                fs_uri,
+                                map_err,
+                            )
+
+                    if linked_db_id is None:
+                        added_item = await mass.send_command(
+                            "music/library/add_item",
+                            item=fs_uri,
+                        )
+                        linked_db_id = (
+                            added_item.get("item_id")
+                            if isinstance(added_item, dict)
+                            else added_item
+                        )
+
                     _LOGGER.info(
                         "Archived and linked '%s' -> /media/%s (library item_id=%s)",
                         self.current_track,
                         rel_media_path,
-                        added_item.get("item_id") if isinstance(added_item, dict) else added_item,
+                        linked_db_id,
                     )
                 else:
                     _LOGGER.info(
@@ -843,6 +919,36 @@ class MusicAssistantArchiver:
                 self.current_track = None
                 self._notify_listeners()
 
+    async def _attach_mappings_to_library_track(
+        self,
+        mass: MusicAssistantClient,
+        track: dict[str, Any],
+        new_mappings: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """
+        Attach new provider mappings directly onto an existing library track via `music/library/add_item`.
+
+        Home Assistant's Music Assistant integration connects with a `service` role token that has
+        `library.write` scope (not `library.manage`), so `music/add_provider_mapping` is rejected.
+        Passing a `Track` dict with `provider="builtin"` and combined `provider_mappings` (the
+        library track's existing mapping(s) + `new_mappings`) causes Music Assistant's
+        `add_item_to_library` to use `full_item = item` directly, match `track["item_id"]` via
+        `get_library_item_by_prov_mappings`, and merge `new_mappings` onto the existing library
+        track without creating a duplicate or firing `MEDIA_ITEM_ADDED`.
+        """
+        merged_track = dict(track)
+        merged_track["provider"] = "builtin"
+        merged_track["media_type"] = "track"
+        merged_track["album"] = None
+        existing_mappings = list(track.get("provider_mappings", []))
+        merged_track["provider_mappings"] = [*existing_mappings, *new_mappings]
+        res = await mass.send_command(
+            "music/library/add_item",
+            item=merged_track,
+            overwrite_existing=False,
+        )
+        return res if isinstance(res, dict) else None
+
     async def _fetch_track(
         self, mass: MusicAssistantClient, uri: str
     ) -> dict[str, Any] | None:
@@ -863,7 +969,10 @@ class MusicAssistantArchiver:
             return None
 
     async def _resolve_playable_source(
-        self, mass: MusicAssistantClient, track: dict[str, Any]
+        self,
+        mass: MusicAssistantClient,
+        track: dict[str, Any],
+        available_instances: set[str] | None = None,
     ) -> tuple[str | None, dict[str, Any] | None]:
         """
         Resolve a playable URI for a track, mirroring `MusicController.refresh_item`.
@@ -874,14 +983,15 @@ class MusicAssistantArchiver:
            all active providers via `music/search` using `Artist - Title` and Title fallback,
            and picks the best matching playable track.
         """
-        providers_list = await mass.send_command("providers")
-        available_instances = {
-            p["instance_id"]
-            for p in providers_list
-            if p.get("available")
-            and p.get("type") == "music"
-            and p.get("domain") != "filesystem_local"
-        }
+        if available_instances is None:
+            providers_list = await mass.send_command("providers")
+            available_instances = {
+                p["instance_id"]
+                for p in providers_list
+                if p.get("available")
+                and p.get("type") == "music"
+                and p.get("domain") != "filesystem_local"
+            }
 
         # Step 1: Check existing provider mappings on the track
         mappings = sorted(
@@ -911,15 +1021,17 @@ class MusicAssistantArchiver:
 
         # Step 2: Fallback to cross-provider search (just like MusicController.refresh_item)
         track_name = track.get("name") or ""
+        clean_title = re.sub(r"\s*[\(\[].*?[\)\]]", "", track_name).strip()
+        effective_title = clean_title or track_name
         artists = [a.get("name") for a in track.get("artists", []) if a.get("name")]
         queries: list[str] = []
-        if artists:
-            queries.append(f"{artists[0]} - {track_name}")
-            queries.append(f"{artists[0]} {track_name}")
-        if track_name:
-            queries.append(track_name)
+        if artists and effective_title:
+            queries.append(f"{artists[0]} {effective_title}")
+        if effective_title:
+            queries.append(effective_title)
 
         target_title_norm = _normalize_text(track_name)
+        clean_title_norm = _normalize_text(clean_title) if clean_title else target_title_norm
         target_artists_norm = [_normalize_text(a) for a in artists if _normalize_text(a)]
         target_duration = track.get("duration") or 0
 
@@ -959,11 +1071,18 @@ class MusicAssistantArchiver:
 
                 # Score candidate by title match, artist match, and duration proximity
                 score = 0
-                if cand_title_norm == target_title_norm:
+                if cand_title_norm in (target_title_norm, clean_title_norm):
                     score += 50
                 elif (
                     target_title_norm in cand_title_norm
                     or cand_title_norm in target_title_norm
+                    or (
+                        clean_title_norm
+                        and (
+                            clean_title_norm in cand_title_norm
+                            or cand_title_norm in clean_title_norm
+                        )
+                    )
                 ):
                     score += 30
                 else:

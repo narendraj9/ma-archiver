@@ -77,6 +77,7 @@ class MAArchiverStatusSensor(_MAArchiverBaseSensor):
             "last_archived_path": self._archiver.last_archived_path,
             "last_error": self._archiver.last_error,
             "archived_this_session": self._archiver.archived_session_count,
+            "refreshed_this_session": self._archiver.refreshed_session_count,
             "total_library_tracks": self._archiver.total_library_tracks,
             "archived_library_tracks": self._archiver.archived_library_tracks,
             "unarchived_library_tracks": self._archiver.unarchived_library_tracks,

@@ -10,7 +10,6 @@ CONF_BITRATE = "bitrate"
 CONF_ARCHIVE_ON_PLAY = "archive_on_play"
 CONF_PERIODIC_SCAN = "periodic_scan"
 CONF_SCAN_INTERVAL_MINUTES = "scan_interval_minutes"
-CONF_BATCH_SIZE = "batch_size"
 CONF_SLIMPROTO_PORT = "slimproto_port"
 
 DEFAULT_OUTPUT_DIR = "/media/archive"
@@ -19,7 +18,6 @@ DEFAULT_BITRATE = "192k"
 DEFAULT_ARCHIVE_ON_PLAY = False
 DEFAULT_PERIODIC_SCAN = True
 DEFAULT_SCAN_INTERVAL_MINUTES = 5
-DEFAULT_BATCH_SIZE = 5
 DEFAULT_SLIMPROTO_PORT = 3483
 
 AUDIO_FORMATS = ["flac", "opus", "m4a"]

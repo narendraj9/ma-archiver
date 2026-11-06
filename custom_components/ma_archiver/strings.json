@@ -10,8 +10,7 @@
           "bitrate": "Audio Bitrate (for Opus/M4A)",
           "archive_on_play": "Archive every song played on any speaker",
           "periodic_scan": "Periodically archive unarchived library tracks in the background",
-          "scan_interval_minutes": "Background scan interval (minutes)",
-          "batch_size": "Tracks to archive per background scan"
+          "scan_interval_minutes": "Background scan interval (minutes)"
         }
       }
     },
@@ -29,8 +28,7 @@
           "bitrate": "Audio Bitrate (for Opus/M4A)",
           "archive_on_play": "Archive every song played on any speaker",
           "periodic_scan": "Periodically archive unarchived library tracks in the background",
-          "scan_interval_minutes": "Background scan interval (minutes)",
-          "batch_size": "Tracks to archive per background scan"
+          "scan_interval_minutes": "Background scan interval (minutes)"
         }
       }
     }

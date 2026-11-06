@@ -1,17 +1,6 @@
 archive_now:
-  name: Archive Library Batch Now
-  description: Immediately scan the Music Assistant library and archive a batch of unarchived tracks to /media.
-  fields:
-    limit:
-      name: Batch Size
-      description: Maximum number of unarchived tracks to archive in this run.
-      required: false
-      example: 10
-      selector:
-        number:
-          min: 1
-          max: 500
-          mode: box
+  name: Archive All Remaining Tracks Now
+  description: Scan the Music Assistant library and archive every remaining unarchived track to /media. Ignored if an archive run is already in progress.
 
 archive_track:
   name: Archive Track by URI
@@ -26,19 +15,8 @@ archive_track:
         text:
 
 refresh_library:
-  name: Refresh Unplayable Library Items
-  description: Scan Music Assistant library tracks that only have dead/removed provider mappings, search active providers for substitutes, and attach the new provider mappings to the library tracks.
-  fields:
-    limit:
-      name: Maximum Tracks to Refresh
-      description: Optional cap on how many unplayable tracks to refresh in this run (omit to refresh all).
-      required: false
-      example: 50
-      selector:
-        number:
-          min: 1
-          max: 5000
-          mode: box
+  name: Refresh Library Items
+  description: Attach substitutes from active providers to library tracks that only have dead/removed provider mappings, then refresh the tags and embedded cover art of all archived files (atomic, lossless in-place update). Ignored if a refresh is already in progress.
 
 reset_archive:
   name: Reset Archive

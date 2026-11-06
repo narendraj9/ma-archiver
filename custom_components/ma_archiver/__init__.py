@@ -15,7 +15,6 @@ from .archiver import MusicAssistantArchiver
 from .const import (
     CONF_ARCHIVE_ON_PLAY,
     CONF_AUDIO_FORMAT,
-    CONF_BATCH_SIZE,
     CONF_BITRATE,
     CONF_OUTPUT_DIR,
     CONF_PERIODIC_SCAN,
@@ -23,7 +22,6 @@ from .const import (
     CONF_SLIMPROTO_PORT,
     DEFAULT_ARCHIVE_ON_PLAY,
     DEFAULT_AUDIO_FORMAT,
-    DEFAULT_BATCH_SIZE,
     DEFAULT_BITRATE,
     DEFAULT_OUTPUT_DIR,
     DEFAULT_PERIODIC_SCAN,
@@ -41,11 +39,7 @@ SERVICE_ARCHIVE_TRACK = "archive_track"
 SERVICE_REFRESH_LIBRARY = "refresh_library"
 SERVICE_RESET_ARCHIVE = "reset_archive"
 
-SCHEMA_ARCHIVE_NOW = vol.Schema(
-    {
-        vol.Optional("limit"): vol.All(vol.Coerce(int), vol.Range(min=1, max=500)),
-    }
-)
+SCHEMA_ARCHIVE_NOW = vol.Schema({})
 
 SCHEMA_ARCHIVE_TRACK = vol.Schema(
     {
@@ -53,11 +47,7 @@ SCHEMA_ARCHIVE_TRACK = vol.Schema(
     }
 )
 
-SCHEMA_REFRESH_LIBRARY = vol.Schema(
-    {
-        vol.Optional("limit"): vol.All(vol.Coerce(int), vol.Range(min=1, max=5000)),
-    }
-)
+SCHEMA_REFRESH_LIBRARY = vol.Schema({})
 
 SCHEMA_RESET_ARCHIVE = vol.Schema(
     {
@@ -80,7 +70,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         scan_interval_minutes=cfg.get(
             CONF_SCAN_INTERVAL_MINUTES, DEFAULT_SCAN_INTERVAL_MINUTES
         ),
-        batch_size=cfg.get(CONF_BATCH_SIZE, DEFAULT_BATCH_SIZE),
         slimproto_port=cfg.get(CONF_SLIMPROTO_PORT, DEFAULT_SLIMPROTO_PORT),
     )
 
@@ -102,10 +91,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         """Handle ma_archiver.archive_now service call."""
         active = _get_active_archiver()
         if active:
-            limit = call.data.get("limit")
-            active.spawn_task(
-                active.async_archive_batch(limit=limit), "ma_archiver_batch"
-            )
+            active.spawn_task(active.async_archive_batch(), "ma_archiver_batch")
 
     async def handle_archive_track(call: ServiceCall) -> None:
         """Handle ma_archiver.archive_track service call."""
@@ -118,9 +104,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         """Handle ma_archiver.refresh_library service call."""
         active = _get_active_archiver()
         if active:
-            limit = call.data.get("limit")
             active.spawn_task(
-                active.async_refresh_library_items(limit=limit), "ma_archiver_refresh"
+                active.async_refresh_library_items(), "ma_archiver_refresh"
             )
 
     async def handle_reset_archive(call: ServiceCall) -> None:
@@ -172,14 +157,12 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
         new_interval = cfg.get(
             CONF_SCAN_INTERVAL_MINUTES, DEFAULT_SCAN_INTERVAL_MINUTES
         )
-        new_batch = cfg.get(CONF_BATCH_SIZE, DEFAULT_BATCH_SIZE)
         if (
             archiver.output_dir == new_output_dir
             and archiver.audio_format == new_format
             and archiver.bitrate == new_bitrate
             and archiver.periodic_scan == new_periodic
             and archiver.scan_interval_minutes == new_interval
-            and archiver.batch_size == new_batch
         ):
             archiver.archive_on_play = cfg.get(
                 CONF_ARCHIVE_ON_PLAY, DEFAULT_ARCHIVE_ON_PLAY

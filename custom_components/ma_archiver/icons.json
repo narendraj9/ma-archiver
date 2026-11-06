@@ -1,0 +1,8 @@
+{
+  "services": {
+    "archive_now": { "service": "mdi:download-multiple" },
+    "archive_track": { "service": "mdi:download" },
+    "refresh_library": { "service": "mdi:refresh-auto" },
+    "reset_archive": { "service": "mdi:delete-sweep" }
+  }
+}

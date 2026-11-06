@@ -27,10 +27,10 @@ async def async_setup_entry(
 
 
 class MAArchiverBatchButton(ButtonEntity):
-    """Button to trigger an immediate archive batch run."""
+    """Button to archive all remaining unarchived library tracks now."""
 
     _attr_has_entity_name = True
-    _attr_name = "MA Archiver Archive Batch Now"
+    _attr_name = "MA Archiver Archive All Now"
     _attr_icon = "mdi:download-multiple"
 
     def __init__(self, archiver: MusicAssistantArchiver, entry_id: str) -> None:
@@ -46,7 +46,7 @@ class MAArchiverBatchButton(ButtonEntity):
 
 
 class MAArchiverRefreshLibraryButton(ButtonEntity):
-    """Button to search active providers and link substitutes for unplayable library tracks."""
+    """Button to relink unplayable tracks and refresh tags/cover art on archived files."""
 
     _attr_has_entity_name = True
     _attr_name = "MA Archiver Refresh Library Items"

@@ -14,14 +14,12 @@ from .const import (
     AUDIO_FORMATS,
     CONF_ARCHIVE_ON_PLAY,
     CONF_AUDIO_FORMAT,
-    CONF_BATCH_SIZE,
     CONF_BITRATE,
     CONF_OUTPUT_DIR,
     CONF_PERIODIC_SCAN,
     CONF_SCAN_INTERVAL_MINUTES,
     DEFAULT_ARCHIVE_ON_PLAY,
     DEFAULT_AUDIO_FORMAT,
-    DEFAULT_BATCH_SIZE,
     DEFAULT_BITRATE,
     DEFAULT_OUTPUT_DIR,
     DEFAULT_PERIODIC_SCAN,
@@ -60,10 +58,6 @@ def _get_schema(defaults: dict[str, Any]) -> vol.Schema:
                     CONF_SCAN_INTERVAL_MINUTES, DEFAULT_SCAN_INTERVAL_MINUTES
                 ),
             ): vol.All(vol.Coerce(int), vol.Range(min=1, max=1440)),
-            vol.Required(
-                CONF_BATCH_SIZE,
-                default=defaults.get(CONF_BATCH_SIZE, DEFAULT_BATCH_SIZE),
-            ): vol.All(vol.Coerce(int), vol.Range(min=1, max=100)),
         }
     )
 

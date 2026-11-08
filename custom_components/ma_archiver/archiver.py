@@ -59,11 +59,6 @@ def _sanitize_path_component(value: str, fallback: str = "Unknown") -> str:
     return cleaned or fallback
 
 
-def _normalize_text(text: str) -> str:
-    """Normalize text for loose title/artist comparison."""
-    return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
-
-
 def _read_flac_duration(path: Path) -> float | None:
     """Parse FLAC STREAMINFO header (first 42 bytes) and return duration in seconds."""
     info = _inspect_flac_file_sync(path, parse_blocks=False)
@@ -1186,21 +1181,67 @@ class MusicAssistantArchiver:
             if has_active_mapping and track.get("uri"):
                 return track["uri"], track
 
-        # Step 2: Fallback to cross-provider search (just like MusicController.refresh_item)
-        track_name = track.get("name") or ""
-        clean_title = re.sub(r"\s*[\(\[].*?[\)\]]", "", track_name).strip()
-        effective_title = clean_title or track_name
+        # Step 2: Fallback to Music Assistant's server-side track lookup & search
+        track_name = (track.get("name") or "").strip()
+        if not track_name:
+            return None, None
         artists = [a.get("name") for a in track.get("artists", []) if a.get("name")]
-        queries: list[str] = []
-        if artists and effective_title:
-            queries.append(f"{artists[0]} {effective_title}")
-        if effective_title:
-            queries.append(effective_title)
+        album_obj = track.get("album") if isinstance(track.get("album"), dict) else None
+        album_name = album_obj.get("name") if album_obj else None
+        track_version = track.get("version") or None
 
-        target_title_norm = _normalize_text(track_name)
-        clean_title_norm = _normalize_text(clean_title) if clean_title else target_title_norm
-        target_artists_norm = [_normalize_text(a) for a in artists if _normalize_text(a)]
-        target_duration = track.get("duration") or 0
+        def _is_usable(cand: Any) -> bool:
+            if not isinstance(cand, dict) or not cand.get("uri"):
+                return False
+            if not cand.get("available", True):
+                return False
+            return any(
+                cm.get("provider_instance") in available_instances
+                and cm.get("available", True)
+                for cm in cand.get("provider_mappings", [])
+            )
+
+        # 2a. Try Music Assistant's built-in `music/track_by_name` matcher first
+        for artist_name in (artists or [None]):
+            try:
+                matched = await mass.send_command(
+                    "music/track_by_name",
+                    track_name=track_name,
+                    artist_name=artist_name,
+                    album_name=album_name,
+                    track_version=track_version,
+                )
+            except Exception as err:
+                _LOGGER.debug(
+                    "music/track_by_name failed for '%s' (%s): %s",
+                    track_name,
+                    artist_name,
+                    err,
+                )
+                matched = None
+            if _is_usable(matched):
+                assert isinstance(matched, dict)
+                _LOGGER.info(
+                    "Found cross-provider substitute via track_by_name for '%s' (%s): %s",
+                    track_name,
+                    track.get("uri"),
+                    matched.get("uri"),
+                )
+                return matched["uri"], matched
+
+        # 2b. Mirror `MusicController.refresh_item`: search active providers and take the
+        #     first available non-library track returned by the providers' search engines.
+        queries: list[str] = []
+        for artist_name in artists:
+            queries.append(f"{artist_name} - {track_name}")
+        queries.append(track_name)
+        for splitter in (" - ", " (", " [", " • ", " | "):
+            if splitter in track_name:
+                short_title = track_name.split(splitter, 1)[0].strip()
+                if short_title:
+                    if artists:
+                        queries.append(f"{artists[0]} - {short_title}")
+                    queries.append(short_title)
 
         for query in dict.fromkeys(queries):
             try:
@@ -1208,94 +1249,29 @@ class MusicAssistantArchiver:
                     "music/search",
                     search_query=query,
                     media_types=["track"],
-                    limit=10,
+                    limit=20,
                     library_only=False,
                 )
             except Exception as err:
                 _LOGGER.debug("Search failed for query '%s': %s", query, err)
                 continue
 
-            candidates = search_res.get("tracks", []) if isinstance(search_res, dict) else []
-            best_candidate: dict[str, Any] | None = None
-            best_score = -1
-
+            candidates = (
+                search_res.get("tracks", []) if isinstance(search_res, dict) else []
+            )
             for cand in candidates:
-                if not isinstance(cand, dict):
-                    continue
-                if cand.get("provider") == "library" or not cand.get("available", True):
-                    continue
-                # Must belong to an active provider
-                cand_mappings = cand.get("provider_mappings", [])
-                if not any(
-                    cm.get("provider_instance") in available_instances
-                    for cm in cand_mappings
+                if (
+                    isinstance(cand, dict)
+                    and cand.get("provider") != "library"
+                    and _is_usable(cand)
                 ):
-                    continue
-
-                cand_title_norm = _normalize_text(cand.get("name") or "")
-                if not cand_title_norm:
-                    continue
-
-                # Score candidate by title match, artist match, and duration proximity
-                score = 0
-                if cand_title_norm in (target_title_norm, clean_title_norm):
-                    score += 50
-                elif (
-                    target_title_norm in cand_title_norm
-                    or cand_title_norm in target_title_norm
-                    or (
-                        clean_title_norm
-                        and (
-                            clean_title_norm in cand_title_norm
-                            or cand_title_norm in clean_title_norm
-                        )
+                    _LOGGER.info(
+                        "Found cross-provider substitute for '%s' (%s): %s",
+                        track_name,
+                        track.get("uri"),
+                        cand.get("uri"),
                     )
-                ):
-                    score += 30
-                else:
-                    continue
-
-                cand_artists_norm = [
-                    _normalize_text(a.get("name") or "")
-                    for a in cand.get("artists", [])
-                ]
-                if target_artists_norm and any(
-                    ta in ca or ca in ta
-                    for ta in target_artists_norm
-                    for ca in cand_artists_norm
-                    if ca
-                ):
-                    score += 40
-                elif target_artists_norm:
-                    # Require at least a partial artist match when the library track has artists
-                    # unless the artist name is embedded in the candidate's title
-                    if not any(ta in cand_title_norm for ta in target_artists_norm):
-                        continue
-                    score += 20
-
-                cand_duration = cand.get("duration") or 0
-                if target_duration and cand_duration:
-                    diff = abs(int(target_duration) - int(cand_duration))
-                    if diff <= 5:
-                        score += 20
-                    elif diff <= 15:
-                        score += 10
-                    elif diff > 60:
-                        score -= 20
-
-                if score > best_score and cand.get("uri"):
-                    best_score = score
-                    best_candidate = cand
-
-            if best_candidate and best_score >= 50:
-                _LOGGER.info(
-                    "Found cross-provider substitute for '%s' (%s): %s (score=%d)",
-                    track_name,
-                    track.get("uri"),
-                    best_candidate.get("uri"),
-                    best_score,
-                )
-                return best_candidate["uri"], best_candidate
+                    return cand["uri"], cand
 
         return None, None
 

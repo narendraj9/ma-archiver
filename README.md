@@ -12,10 +12,11 @@ custom_components/ma_archiver/
 ├── archiver.py          # Core coordinator: event listener, queue worker, source resolver, ffmpeg pipeline
 ├── slimproto_client.py  # Asyncio Slimproto client registering hidden player `02:00:00:aa:bb:cc`
 ├── config_flow.py       # UI setup & options flow (output dir, format, scan interval)
-├── sensor.py            # Status, Archived Tracks, and Unarchived Tracks sensors
+├── sensor.py            # Status, Current Track (with cover art), Current Album, Run Progress, and Library sensors
 ├── button.py            # "Archive All Now" and "Refresh Library Items" buttons
 ├── switch.py            # "Archive Played Songs" live toggle switch
-├── const.py             # Domain constants and default configuration values
+├── logbook.py           # Logbook / Device Activity feed event formatter (`ma_archiver_activity`)
+├── const.py             # Domain constants, DeviceInfo builder, and default configuration values
 ├── icons.json           # Service icons for the HA UI
 ├── brand/               # Integration icon/logo shown in Home Assistant (icon.png, icon@2x.png, logo*.png)
 └── services.yaml        # Service schemas for Developer Tools -> Actions
@@ -78,8 +79,13 @@ Configured under **Settings → Devices & Services → Music Assistant Archiver 
 
 ## Entities & Services
 
+All entities are grouped under the unified **MA Archiver** Device page (**Settings → Devices & Services → Music Assistant Archiver**), which displays **Controls**, **Sensors**, and a live scrolling **Activity** feed (Logbook entries for every track archived, relinked, or updated).
+
 ### Entities
-* **`sensor.ma_archiver_status`**: `idle`, `archiving`, `refreshing_library`, or `refreshing_metadata`. Attributes show `current_track`, `last_archived_track`, `last_archived_path`, `last_error`, `metadata_updated_this_session`, and library counts.
+* **`sensor.ma_archiver_status`**: `idle`, `archiving`, `refreshing_library`, or `refreshing_metadata`. Attributes expose structured details for the active and last archived track, session counters, and library counts.
+* **`sensor.ma_archiver_current_track`**: Displays `<Title> — <Artist>` (or `Idle`) and renders the current track's **album cover thumbnail** via `entity_picture`. Exposes structured attributes (`title`, `artist`, `album`, `year`, `uri`, `source_provider`, `target_path`, `cover_url`, `progress`, and `last_archived_*`).
+* **`sensor.ma_archiver_current_album`**: Displays `<Album> (<Year>)` of the track currently being archived or refreshed (or `Idle`).
+* **`sensor.ma_archiver_run_progress`**: Live percentage completion (`0%`–`100%`) of the active archive or refresh run, with attributes `completed`, `total`, `progress` (`"14 / 120"`), and `operation`.
 * **`sensor.ma_archiver_archived_tracks`**: Number of library tracks with a verified local copy on disk.
 * **`sensor.ma_archiver_unarchived_tracks`**: Number of library tracks still waiting to be archived locally.
 * **`switch.ma_archiver_archive_played_songs`**: Live toggle for archiving tracks when played on any speaker.

@@ -21,8 +21,13 @@ import aiohttp
 from music_assistant_models.enums import EventType, MediaType, PlaybackState
 
 from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import ATTR_DEVICE_ID, ATTR_ENTITY_ID, ATTR_NAME
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
-from homeassistant.helpers import aiohttp_client
+from homeassistant.helpers import (
+    aiohttp_client,
+    device_registry as dr,
+    entity_registry as er,
+)
 from homeassistant.helpers.event import async_track_time_interval
 
 from .const import (
@@ -34,6 +39,8 @@ from .const import (
     DEFAULT_PERIODIC_SCAN,
     DEFAULT_SCAN_INTERVAL_MINUTES,
     DEFAULT_SLIMPROTO_PORT,
+    DOMAIN,
+    EVENT_MA_ARCHIVER_ACTIVITY,
 )
 from .slimproto_client import VirtualSlimprotoPlayer
 
@@ -174,6 +181,7 @@ class MusicAssistantArchiver:
     def __init__(
         self,
         hass: HomeAssistant,
+        entry_id: str | None = None,
         output_dir: str = DEFAULT_OUTPUT_DIR,
         audio_format: str = DEFAULT_AUDIO_FORMAT,
         bitrate: str = DEFAULT_BITRATE,
@@ -184,6 +192,7 @@ class MusicAssistantArchiver:
     ) -> None:
         """Initialize the Music Assistant Archiver."""
         self.hass = hass
+        self.entry_id = entry_id
         self.output_dir = output_dir
         self.audio_format = audio_format
         self.bitrate = bitrate
@@ -210,8 +219,23 @@ class MusicAssistantArchiver:
 
         # Status / telemetry exposed to HA sensors
         self.status: str = "idle"
+        self.current_operation: str = "idle"
         self.current_track: str | None = None
+        self.current_title: str | None = None
+        self.current_artist: str | None = None
+        self.current_album: str | None = None
+        self.current_year: int | None = None
+        self.current_uri: str | None = None
+        self.current_source_provider: str | None = None
+        self.current_target_path: str | None = None
+        self.current_cover_url: str | None = None
+        self.progress_completed: int = 0
+        self.progress_total: int = 0
         self.last_archived_track: str | None = None
+        self.last_archived_title: str | None = None
+        self.last_archived_artist: str | None = None
+        self.last_archived_album: str | None = None
+        self.last_archived_cover_url: str | None = None
         self.last_archived_path: str | None = None
         self.last_error: str | None = None
         self.archived_session_count: int = 0
@@ -248,6 +272,164 @@ class MusicAssistantArchiver:
         """Notify all registered sensor entities of state changes."""
         for listener in list(self._listeners):
             listener()
+
+    def _get_cover_url(self, track: dict[str, Any]) -> str | None:
+        """Return a browser-accessible cover art URL for `entity_picture` and attributes."""
+        candidates = self._image_candidates(track)
+        # 1. Prefer directly accessible HTTPS/HTTP URLs so browsers and mobile apps
+        #    outside the internal Docker network can load the thumbnail directly.
+        for img in candidates:
+            if img.get("type") not in (None, "thumb"):
+                continue
+            path = str(img.get("path") or "")
+            if path.startswith(("https://", "http://")) and img.get(
+                "remotely_accessible", True
+            ):
+                return path
+        # 2. Fall back to Music Assistant's imageproxy endpoint if available.
+        if self._mass_url:
+            for img in candidates:
+                if img.get("type") not in (None, "thumb"):
+                    continue
+                path = str(img.get("path") or "")
+                provider = str(img.get("provider") or "")
+                image_id = img.get("proxy_id") or (
+                    hashlib.sha256(f"{provider}/{path}".encode()).hexdigest()
+                    if provider
+                    else None
+                )
+                if image_id:
+                    return (
+                        f"{self._mass_url}/imageproxy/{quote(str(image_id))}"
+                        "?size=256&fmt=jpeg"
+                    )
+                if provider:
+                    return (
+                        f"{self._mass_url}/imageproxy?path={quote(path, safe='')}"
+                        f"&provider={quote(provider, safe='')}&size=256&fmt=jpeg"
+                    )
+        return None
+
+    def _extract_track_display_info(self, track: dict[str, Any]) -> dict[str, Any]:
+        """Extract human-friendly title, artist, album, year, and cover URL from a track dict."""
+        title = str(track.get("name") or "Unknown Track").strip() or "Unknown Track"
+        version = str(track.get("version") or "").strip()
+        display_title = f"{title} ({version})" if version else title
+
+        artists = [
+            str(a.get("name")).strip()
+            for a in (track.get("artists") or [])
+            if isinstance(a, dict) and a.get("name")
+        ]
+        artist = ", ".join(artists) if artists else "Unknown Artist"
+
+        album_obj = track.get("album") if isinstance(track.get("album"), dict) else {}
+        album = str(album_obj.get("name") or "").strip() or None
+        year_val = album_obj.get("year")
+        year: int | None = (
+            int(year_val)
+            if isinstance(year_val, int)
+            or (isinstance(year_val, str) and year_val.isdigit())
+            else None
+        )
+        return {
+            "title": display_title,
+            "artist": artist,
+            "album": album,
+            "year": year,
+            "cover_url": self._get_cover_url(track),
+        }
+
+    def _set_active_track_info(
+        self,
+        track: dict[str, Any],
+        *,
+        operation: str,
+        uri: str | None = None,
+        source_provider: str | None = None,
+        target_path: str | None = None,
+    ) -> None:
+        """Populate live current-track telemetry fields from `track`."""
+        info = self._extract_track_display_info(track)
+        self.current_operation = operation
+        self.current_title = info["title"]
+        self.current_artist = info["artist"]
+        self.current_album = info["album"]
+        self.current_year = info["year"]
+        self.current_uri = uri or track.get("uri")
+        if source_provider is not None:
+            self.current_source_provider = source_provider
+        if target_path is not None:
+            self.current_target_path = target_path
+        if info["cover_url"]:
+            self.current_cover_url = info["cover_url"]
+
+    def _clear_active_track_info(self, *, reset_progress: bool = False) -> None:
+        """Reset live current-track telemetry fields back to idle."""
+        self.current_operation = "idle"
+        self.current_track = None
+        self.current_title = None
+        self.current_artist = None
+        self.current_album = None
+        self.current_year = None
+        self.current_uri = None
+        self.current_source_provider = None
+        self.current_target_path = None
+        self.current_cover_url = None
+        if reset_progress:
+            self.progress_completed = 0
+            self.progress_total = 0
+
+    def _record_activity(
+        self,
+        operation: str,
+        track: dict[str, Any],
+        *,
+        extra_detail: str | None = None,
+    ) -> None:
+        """Fire a Logbook / Device Activity event for a completed track action."""
+        info = self._extract_track_display_info(track)
+        title = info["title"]
+        artist = info["artist"]
+        album = info["album"]
+        album_suffix = f" ({album})" if album else ""
+
+        if operation == "archived":
+            message = f"archived '{title}' by {artist}{album_suffix}"
+        elif operation == "relinked":
+            via = f" via {extra_detail}" if extra_detail else ""
+            message = f"relinked '{title}' by {artist}{album_suffix}{via}"
+        elif operation == "metadata_updated":
+            message = f"updated tags & cover art for '{title}' by {artist}{album_suffix}"
+        else:
+            message = f"{operation} '{title}' by {artist}{album_suffix}"
+
+        event_data: dict[str, Any] = {
+            ATTR_NAME: "MA Archiver",
+            "operation": operation,
+            "message": message,
+            "title": title,
+            "artist": artist,
+            "album": album,
+        }
+        if extra_detail:
+            event_data["detail"] = extra_detail
+
+        if self.entry_id:
+            ent_reg = er.async_get(self.hass)
+            entity_id = ent_reg.async_get_entity_id(
+                "sensor", DOMAIN, f"{self.entry_id}_current_track"
+            ) or ent_reg.async_get_entity_id(
+                "sensor", DOMAIN, f"{self.entry_id}_status"
+            )
+            if entity_id:
+                event_data[ATTR_ENTITY_ID] = entity_id
+            dev_reg = dr.async_get(self.hass)
+            device = dev_reg.async_get_device(identifiers={(DOMAIN, self.entry_id)})
+            if device:
+                event_data[ATTR_DEVICE_ID] = device.id
+
+        self.hass.bus.async_fire(EVENT_MA_ARCHIVER_ACTIVITY, event_data)
 
     def _get_mass_client(self) -> tuple[MusicAssistantClient | None, str | None]:
         """Return the active MusicAssistantClient and server URL from Home Assistant."""
@@ -665,32 +847,43 @@ class MusicAssistantArchiver:
         async with self._batch_lock:
             archived_count = 0
             attempted: set[str] = set()
-            while not self._stopped:
-                unarchived = await self.async_refresh_library_stats()
-                now = time.monotonic()
-                pending: list[str] = []
-                for track in unarchived:
-                    uri = track.get("uri")
-                    if not uri or uri in attempted:
-                        continue
-                    failed_at = self._failed_tracks.get(uri)
-                    if failed_at and (now - failed_at) < FAILED_TRACK_COOLDOWN_SECONDS:
-                        continue
-                    pending.append(uri)
+            self.progress_completed = 0
+            self.progress_total = 0
+            try:
+                while not self._stopped:
+                    unarchived = await self.async_refresh_library_stats()
+                    now = time.monotonic()
+                    pending: list[str] = []
+                    for track in unarchived:
+                        uri = track.get("uri")
+                        if not uri or uri in attempted:
+                            continue
+                        failed_at = self._failed_tracks.get(uri)
+                        if failed_at and (now - failed_at) < FAILED_TRACK_COOLDOWN_SECONDS:
+                            continue
+                        pending.append(uri)
 
-                if not pending:
-                    break
-
-                _LOGGER.info("Archiving %d remaining library tracks", len(pending))
-                for uri in pending:
-                    if self._stopped:
+                    if not pending:
                         break
-                    attempted.add(uri)
-                    if await self.async_archive_uri(uri):
-                        archived_count += 1
 
-            if not self._stopped:
-                await self.async_refresh_library_stats()
+                    self.progress_total = self.progress_completed + len(pending)
+                    self._notify_listeners()
+                    _LOGGER.info("Archiving %d remaining library tracks", len(pending))
+                    for uri in pending:
+                        if self._stopped:
+                            break
+                        attempted.add(uri)
+                        if await self.async_archive_uri(uri, reset_to_idle=False):
+                            archived_count += 1
+                        self.progress_completed += 1
+                        self._notify_listeners()
+            finally:
+                self.status = "idle"
+                self._clear_active_track_info(reset_progress=True)
+                if not self._stopped:
+                    await self.async_refresh_library_stats()
+                else:
+                    self._notify_listeners()
             _LOGGER.info(
                 "Archive run finished: %d tracks archived, %d still unarchived",
                 archived_count,
@@ -767,6 +960,9 @@ class MusicAssistantArchiver:
             refreshed_count = 0
             metadata_updated = 0
             self.status = "refreshing_library"
+            self.current_operation = "relinking"
+            self.progress_completed = 0
+            self.progress_total = total_dead
             self.current_track = f"Refreshing (0/{total_dead} unplayable tracks)"
             self._notify_listeners()
 
@@ -777,15 +973,18 @@ class MusicAssistantArchiver:
 
                     db_id = str(track.get("item_id") or "")
                     if not db_id:
+                        self.progress_completed = idx
                         continue
 
-                    track_title = track.get("name") or "Unknown Track"
-                    artists = [a.get("name") for a in track.get("artists", []) if a.get("name")]
-                    artist_display = ", ".join(artists) if artists else "Unknown Artist"
                     self.status = "refreshing_library"
+                    self._set_active_track_info(
+                        track,
+                        operation="relinking",
+                        uri=track.get("uri") or f"library://track/{db_id}",
+                    )
                     self.current_track = (
                         f"Refreshing ({idx}/{total_dead}, {refreshed_count} linked): "
-                        f"{artist_display} - {track_title}"
+                        f"{self.current_artist} - {self.current_title}"
                     )
                     self._notify_listeners()
 
@@ -793,6 +992,7 @@ class MusicAssistantArchiver:
                         mass, track, available_instances=available_instances
                     )
                     if not playable_uri or not isinstance(resolved_track, dict):
+                        self.progress_completed = idx
                         continue
 
                     resolved_mappings = [
@@ -801,6 +1001,7 @@ class MusicAssistantArchiver:
                         if pm.get("provider_instance") in available_instances
                     ]
                     if not resolved_mappings:
+                        self.progress_completed = idx
                         continue
 
                     try:
@@ -809,9 +1010,19 @@ class MusicAssistantArchiver:
                         )
                         refreshed_count += 1
                         self.refreshed_session_count += 1
+                        provider_prefix = (
+                            playable_uri.split("://", 1)[0]
+                            if "://" in playable_uri
+                            else playable_uri
+                        )
+                        self._record_activity(
+                            "relinked",
+                            resolved_track or track,
+                            extra_detail=provider_prefix,
+                        )
                         _LOGGER.info(
                             "Refreshed library track '%s' (library://track/%s) with %s",
-                            track_title,
+                            self.current_title,
                             db_id,
                             playable_uri,
                         )
@@ -822,6 +1033,7 @@ class MusicAssistantArchiver:
                             playable_uri,
                             err,
                         )
+                    self.progress_completed = idx
 
                 # Pass 2: refresh tags + embedded cover art on already-archived files
                 archived_tracks: list[tuple[dict[str, Any], str]] = []
@@ -836,16 +1048,26 @@ class MusicAssistantArchiver:
                             break
 
                 total_archived = len(archived_tracks)
+                self._clear_active_track_info(reset_progress=True)
+                self.status = "refreshing_metadata"
+                self.current_operation = "updating_metadata"
+                self.progress_total = total_archived
+                last_notify_ts = 0.0
                 for idx, (track, rel_item_id) in enumerate(archived_tracks, start=1):
                     if self._stopped:
                         break
                     track_title = track.get("name") or "Unknown Track"
                     self.status = "refreshing_metadata"
+                    self.current_operation = "updating_metadata"
+                    self.progress_completed = idx - 1
                     self.current_track = (
-                        f"Updating metadata ({idx}/{total_archived}, "
+                        f"Checking metadata ({idx}/{total_archived}, "
                         f"{metadata_updated} updated): {track_title}"
                     )
-                    self._notify_listeners()
+                    now_ts = time.monotonic()
+                    if idx == 1 or idx == total_archived or (now_ts - last_notify_ts) >= 1.0:
+                        self._notify_listeners()
+                        last_notify_ts = now_ts
                     try:
                         if await self._update_existing_file_metadata_and_art(
                             mass, track, rel_item_id
@@ -860,9 +1082,10 @@ class MusicAssistantArchiver:
                             rel_item_id,
                             err,
                         )
+                    self.progress_completed = idx
             finally:
                 self.status = "idle"
-                self.current_track = None
+                self._clear_active_track_info(reset_progress=True)
                 if not self._stopped:
                     with contextlib.suppress(Exception):
                         await self.async_refresh_library_stats()
@@ -911,7 +1134,7 @@ class MusicAssistantArchiver:
 
         await self.async_refresh_library_stats()
 
-    async def async_archive_uri(self, uri: str) -> bool:
+    async def async_archive_uri(self, uri: str, *, reset_to_idle: bool = True) -> bool:
         """
         Archive a single track URI (either `library://track/<id>` or `<provider>://track/<id>`).
 
@@ -938,11 +1161,12 @@ class MusicAssistantArchiver:
                     _LOGGER.debug("Track %s (%s) is already archived locally", track.get("name"), uri)
                     return True
 
-                track_title = track.get("name") or "Unknown Track"
-                artists = [a.get("name") for a in track.get("artists", []) if a.get("name")]
-                artist_display = ", ".join(artists) if artists else "Unknown Artist"
+                if reset_to_idle:
+                    self.progress_completed = 0
+                    self.progress_total = 1
                 self.status = "archiving"
-                self.current_track = f"{artist_display} - {track_title}"
+                self._set_active_track_info(track, operation="archiving", uri=uri)
+                self.current_track = f"{self.current_artist} - {self.current_title}"
                 self._notify_listeners()
 
                 # 2. Resolve playable URI:
@@ -995,6 +1219,19 @@ class MusicAssistantArchiver:
 
                 # 3. Compute target file path in /media/archive/<Artist>/<Album>/<Track>.<ext>
                 abs_target_path, rel_media_path = self._build_target_paths(metadata_track)
+                source_provider = (
+                    playable_uri.split("://", 1)[0]
+                    if "://" in playable_uri
+                    else None
+                )
+                self._set_active_track_info(
+                    metadata_track,
+                    operation="archiving",
+                    uri=uri,
+                    source_provider=source_provider,
+                    target_path=f"/media/{rel_media_path}",
+                )
+                self._notify_listeners()
 
                 # 4. Transcode/tag stream via ffmpeg
                 stream_duration = int(
@@ -1075,9 +1312,18 @@ class MusicAssistantArchiver:
 
                 self.archived_session_count += 1
                 self.last_archived_track = self.current_track
+                self.last_archived_title = self.current_title
+                self.last_archived_artist = self.current_artist
+                self.last_archived_album = self.current_album
+                self.last_archived_cover_url = self.current_cover_url
                 self.last_archived_path = f"/media/{rel_media_path}"
                 self.last_error = None
                 self._failed_tracks.pop(uri, None)
+                self._record_activity(
+                    "archived",
+                    metadata_track,
+                    extra_detail=f"/media/{rel_media_path}",
+                )
                 return True
 
             except Exception as err:
@@ -1087,9 +1333,10 @@ class MusicAssistantArchiver:
                 _LOGGER.warning("Failed to archive track %s: %s", uri, err_detail)
                 return False
             finally:
-                self.status = "idle"
-                self.current_track = None
-                self._notify_listeners()
+                if reset_to_idle:
+                    self.status = "idle"
+                    self._clear_active_track_info(reset_progress=True)
+                    self._notify_listeners()
 
     async def _attach_mappings_to_library_track(
         self,
@@ -1766,6 +2013,14 @@ class MusicAssistantArchiver:
                 # Only missing art, and none available: nothing to do
                 return False
 
+            # File is actually being updated: expose full track info + cover art on sensors
+            self._set_active_track_info(
+                full_track,
+                operation="updating_metadata",
+                target_path=f"/media/{rel_item_id}",
+            )
+            self._notify_listeners()
+
             part_path = abs_file.with_name(f".{abs_file.stem}.part.{audio_format}")
             try:
                 if cover_path is not None:
@@ -1810,6 +2065,11 @@ class MusicAssistantArchiver:
                 )
 
             await asyncio.to_thread(os.replace, part_path, abs_file)
+            self._record_activity(
+                "metadata_updated",
+                full_track,
+                extra_detail=f"/media/{rel_item_id}",
+            )
             _LOGGER.info(
                 "Updated metadata%s on /media/%s",
                 " and cover art" if cover_path is not None else "",

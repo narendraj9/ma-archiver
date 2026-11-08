@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
+
 DOMAIN = "ma_archiver"
 
 CONF_OUTPUT_DIR = "output_dir"
@@ -25,3 +27,19 @@ AUDIO_FORMATS = ["flac", "opus", "m4a"]
 # Dedicated virtual Squeezelite player MAC/ID used solely by the archiver
 ARCHIVER_PLAYER_ID = "02:00:00:aa:bb:cc"
 ARCHIVER_PLAYER_NAME = "MA Archiver"
+
+# Event fired for Home Assistant Logbook / Device Activity feed
+EVENT_MA_ARCHIVER_ACTIVITY = "ma_archiver_activity"
+
+
+def build_device_info(entry_id: str) -> DeviceInfo:
+    """Return the unified DeviceInfo for Music Assistant Archiver entities."""
+    return DeviceInfo(
+        identifiers={(DOMAIN, entry_id)},
+        name="MA Archiver",
+        manufacturer="Music Assistant",
+        model="Library & Playback Archiver",
+        entry_type=DeviceEntryType.SERVICE,
+    )
+
+

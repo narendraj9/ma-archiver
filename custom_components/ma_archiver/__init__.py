@@ -29,6 +29,7 @@ from .const import (
     DEFAULT_SLIMPROTO_PORT,
     DOMAIN,
 )
+from .logbook import async_register_logbook_if_loaded
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -62,6 +63,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     archiver = MusicAssistantArchiver(
         hass=hass,
+        entry_id=entry.entry_id,
         output_dir=cfg.get(CONF_OUTPUT_DIR, DEFAULT_OUTPUT_DIR),
         audio_format=cfg.get(CONF_AUDIO_FORMAT, DEFAULT_AUDIO_FORMAT),
         bitrate=cfg.get(CONF_BITRATE, DEFAULT_BITRATE),
@@ -75,6 +77,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = archiver
+    async_register_logbook_if_loaded(hass)
 
     await archiver.async_start()
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

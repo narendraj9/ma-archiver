@@ -8,7 +8,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .archiver import MusicAssistantArchiver
-from .const import DOMAIN
+from .const import DOMAIN, build_device_info
 
 
 async def async_setup_entry(
@@ -30,13 +30,14 @@ class MAArchiverBatchButton(ButtonEntity):
     """Button to archive all remaining unarchived library tracks now."""
 
     _attr_has_entity_name = True
-    _attr_name = "MA Archiver Archive All Now"
+    _attr_name = "Archive All Now"
     _attr_icon = "mdi:download-multiple"
 
     def __init__(self, archiver: MusicAssistantArchiver, entry_id: str) -> None:
         """Initialize the button."""
         self._archiver = archiver
         self._attr_unique_id = f"{entry_id}_archive_batch_now"
+        self._attr_device_info = build_device_info(entry_id)
 
     async def async_press(self) -> None:
         """Handle button press."""
@@ -49,13 +50,14 @@ class MAArchiverRefreshLibraryButton(ButtonEntity):
     """Button to relink unplayable tracks and refresh tags/cover art on archived files."""
 
     _attr_has_entity_name = True
-    _attr_name = "MA Archiver Refresh Library Items"
+    _attr_name = "Refresh Library Items"
     _attr_icon = "mdi:refresh-auto"
 
     def __init__(self, archiver: MusicAssistantArchiver, entry_id: str) -> None:
         """Initialize the button."""
         self._archiver = archiver
         self._attr_unique_id = f"{entry_id}_refresh_library_items"
+        self._attr_device_info = build_device_info(entry_id)
 
     async def async_press(self) -> None:
         """Handle button press."""

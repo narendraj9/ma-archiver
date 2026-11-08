@@ -10,7 +10,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .archiver import MusicAssistantArchiver
-from .const import CONF_ARCHIVE_ON_PLAY, DOMAIN
+from .const import CONF_ARCHIVE_ON_PLAY, DOMAIN, build_device_info
 
 
 async def async_setup_entry(
@@ -27,7 +27,7 @@ class MAArchiverOnPlaySwitch(SwitchEntity):
     """Switch to toggle archiving of songs when played on any speaker."""
 
     _attr_has_entity_name = True
-    _attr_name = "MA Archiver Archive Played Songs"
+    _attr_name = "Archive Played Songs"
     _attr_icon = "mdi:play-box-lock-outline"
 
     def __init__(
@@ -41,6 +41,7 @@ class MAArchiverOnPlaySwitch(SwitchEntity):
         self._entry = entry
         self._archiver = archiver
         self._attr_unique_id = f"{entry.entry_id}_archive_on_play"
+        self._attr_device_info = build_device_info(entry.entry_id)
 
     @property
     def is_on(self) -> bool:
